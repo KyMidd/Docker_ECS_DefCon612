@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ado-builder-deployment
+  namespace: ado-builders
+  labels:
+    app: ado-pool-ubuntu2004
+spec:
+  replicas: 5 #here is the configuration for the actual agent always running
+  selector:
+    matchLabels:
+      app: ado-pool-ubuntu2004
+  template:
+    metadata:
+      labels:
+        app: ado-pool-ubuntu2004
+    spec:
+      nodeSelector:
+        agentpool: builderpool
+      restartPolicy: Always
+      containers:
+      - name: ado-pool-ubuntu2004
+        image: acr-url.azurecr.io/image-name:prod
+        env:
+          - name: AZP_URL
+            valueFrom:
+              secretKeyRef:
+                name: ado
+                key: AZP_URL
+          - name: AZP_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: ado
+                key: AZP_TOKEN
+          - name: AZP_POOL
+            valueFrom:
+              secretKeyRef:
+                name: ado
+                key: AZP_POOL
+        volumeMounts:
+        - mountPath: /var/run/docker.sock
+          name: docker-volume
+        imagePullPolicy: Always
+      volumes:
+      - name: docker-volume
+        hostPath:
+          path: /var/run/docker.sock

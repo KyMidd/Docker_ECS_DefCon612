@@ -1,0 +1,162 @@
+variables:
+  # Build pool
+  hosted_pool_image_specification: 'foobar'
+
+  # Build image info
+  docker_file_location: 'DockerBuild/Dockerfile'
+  build_context: 'DockerBuild'
+  image_name: 'foobar'
+  dest_tag: 'prod'
+
+  # Azure ACR & AKS definitions 
+  # ACR service connection thats registered in Azure DevOps
+  acr_service_connection: 'Ue1BuilderAcr'
+  acr_repository_name: 'ue1-builder-ado-ubuntu2004' #if it does not exist, the pipeline will create it.
+  aks_namespace: 'ado-builder-ubuntu-2004'
+  # AKS service connection thats registered in Azure DevOps
+  aks_service_connection: 'Ue1-Ado-Builder-Linux'
+  aks_manifest_file: 'DockerBuild/AKS.yml'
+
+  # AWS ECR info
+  ecr_repository_name: 'ue1-ado-builder-ubu2004'
+  ecr_account_id: '1234567890'
+  ecr_region: 'us-east-1'
+  aws_credential: 'Ue1-Ado-Builder-Linux-AWS'
+
+# Automatically trigger pipeline when master branch updated (PR merged) in path "config/*"
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - DockerBuild/*
+
+# Scheduled builds, automatic build and deploy
+schedules:
+- cron: "0 6 * * *" # Every day at 6a UTC / 11p PST 
+  displayName: Build Each Day Automatically
+  branches:
+    include: 
+    - master
+  always: true # Rebuild even when no code changes
+
+# Release instructions
+stages:
+- stage: Build_And_Validate
+  # Only run stage when triggered from pull request
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+  jobs:
+  - deployment: Build_And_Validate
+    displayName: Build and Validate Docker
+    timeoutInMinutes: 0
+    # pool: $(pool)
+    pool:
+      vmImage: $(hosted_pool_image_specification)
+    environment: Build_And_Validate
+    continueOnError: false
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - task: Docker@0
+              displayName: Build the image
+              timeoutInMinutes: 0
+              inputs:
+                containerregistrytype: 'Container Registry'
+                dockerFile: $(docker_file_location)
+                imageName: $(image_name)
+                includeLatestTag: true
+
+- stage: Deploy_Image_to_ACR_and_ECR
+  # Only run stage when triggered from pull request
+  condition: ne(variables['Build.Reason'], 'PullRequest')
+  jobs:
+  - deployment: Deploy_Image_to_ACR_and_ECR
+    displayName: Deploy Image to ACR and ECR
+    timeoutInMinutes: 0
+    pool:
+      vmImage: $(hosted_pool_image_specification)
+    environment: Deploy_Image_to_ACR_and_ECR
+    continueOnError: false
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - task: Docker@0
+              displayName: Build the image
+              timeoutInMinutes: 0
+              inputs:
+                containerregistrytype: 'Container Registry'
+                dockerFile: $(docker_file_location)
+                imageName: $(image_name)
+                includeLatestTag: true
+
+            - task: AmazonWebServices.aws-vsts-tools.ECRPushImage.ECRPushImage@1
+              displayName: 'Push image to ECR'
+              inputs:
+                awsCredentials: $(aws_credential)
+                regionName: $(ecr_region)
+                sourceImageName: $(image_name)
+                repositoryName: $(ecr_repository_name)
+                pushTag: $(dest_tag)
+
+            - task: AzureCLI@2
+              displayName: Add builder IP to ACR permit list
+              continueOnError: true
+              inputs:
+                azureSubscription: 'Service-Connection-in-ADO'
+                workingDirectory: $(System.DefaultWorkingDirectory)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  # Get  builder IP
+                  builderIp=$(curl -s checkip.amazonaws.com)
+                  echo "Builder IP found to be $builderIp"
+
+                  # Add builder IP to ACR permit list
+                  echo "Add builder IP to ACR permit list"
+                  az acr network-rule add --name $(acr_service_connection) --ip-address $builderIp
+
+                  # Wait a while to let ACR policy stabilize
+                  echo "Sleeping for 120 seconds to let ACR policy stabilize"
+                  sleep 120
+
+            - task: Docker@2
+              displayName: 'Push image to ACR'
+              inputs:
+                containerRegistry: $(acr_service_connection)
+                repository: $(acr_repository_name)
+                Dockerfile: $(docker_file_location)
+                buildContext: $(build_context)
+                tags: $(dest_tag)
+                command: buildAndPush
+
+            - task: AzureCLI@2
+              displayName: Remove builder IP from ACR permit list
+              continueOnError: true
+              condition: always() # Restore rules even if error above
+              inputs:
+                azureSubscription: 'Service-Connection-in-ADO'
+                workingDirectory: $(System.DefaultWorkingDirectory)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  # Get  builder IP
+                  builderIp=$(curl -s checkip.amazonaws.com)
+                  echo "Builder IP found to be $builderIp"
+
+                  # Remove builder IP from ACR permit list
+                  echo "Remove builder IP from ACR permit list"
+                  az acr network-rule remove --name $(acr_service_connection) --ip-address $builderIp
+
+            - task: KubernetesManifest@0
+              displayName: 'Deploy to K8s'
+              inputs:
+                kubernetesServiceConnection: $(aks_service_connection)
+                namespace: $(aks_namespace)
+                manifests: $(aks_manifest_file)
